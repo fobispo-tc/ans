@@ -14,6 +14,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"strings"
 	"testing"
@@ -200,4 +201,176 @@ func selfSignedCertPEM(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+// ----- applyDNSRecordStyle -----
+
+// TestApplyDNSRecordStyle covers the V1-pin / V2-default / V2-validate
+// branches, including the INVALID_DNS_RECORD_STYLE error path. The
+// integration tests follow happy paths through RegisterAgent and don't
+// reach the invalid-value branch directly.
+func TestApplyDNSRecordStyle(t *testing.T) {
+	tests := []struct {
+		name        string
+		req         RegisterRequest
+		wantStyle   domain.DNSRecordStyle
+		wantErrCode string
+	}{
+		{
+			name: "v1_pins_to_legacy_ignoring_request_field",
+			req: RegisterRequest{
+				SchemaVersion:  "V1",
+				DNSRecordStyle: domain.DNSRecordStyleConsolidated,
+			},
+			wantStyle: domain.DNSRecordStyleLegacy,
+		},
+		{
+			name:      "v2_empty_normalizes_to_default",
+			req:       RegisterRequest{SchemaVersion: "V2", DNSRecordStyle: ""},
+			wantStyle: domain.DefaultDNSRecordStyle,
+		},
+		{
+			name:      "unset_schema_treated_as_v2_default",
+			req:       RegisterRequest{SchemaVersion: "", DNSRecordStyle: ""},
+			wantStyle: domain.DefaultDNSRecordStyle,
+		},
+		{
+			name:      "v2_valid_consolidated",
+			req:       RegisterRequest{SchemaVersion: "V2", DNSRecordStyle: domain.DNSRecordStyleConsolidated},
+			wantStyle: domain.DNSRecordStyleConsolidated,
+		},
+		{
+			name:      "v2_valid_legacy",
+			req:       RegisterRequest{SchemaVersion: "V2", DNSRecordStyle: domain.DNSRecordStyleLegacy},
+			wantStyle: domain.DNSRecordStyleLegacy,
+		},
+		{
+			name:      "v2_valid_both",
+			req:       RegisterRequest{SchemaVersion: "V2", DNSRecordStyle: domain.DNSRecordStyleBoth},
+			wantStyle: domain.DNSRecordStyleBoth,
+		},
+		{
+			name:        "v2_invalid_value_rejected",
+			req:         RegisterRequest{SchemaVersion: "V2", DNSRecordStyle: domain.DNSRecordStyle("garbage")},
+			wantErrCode: "INVALID_DNS_RECORD_STYLE",
+		},
+		{
+			// CONSTANT_CASE is the wire form. lowercase is rejected so the
+			// V2 enum stays consistent with every other enum on the spec.
+			name:        "v2_lowercase_legacy_rejected_as_invalid",
+			req:         RegisterRequest{SchemaVersion: "V2", DNSRecordStyle: domain.DNSRecordStyle("legacy")},
+			wantErrCode: "INVALID_DNS_RECORD_STYLE",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := &domain.AgentRegistration{}
+			err := applyDNSRecordStyle(reg, tc.req)
+			if tc.wantErrCode != "" {
+				if err == nil {
+					t.Fatalf("want error code %q, got nil", tc.wantErrCode)
+				}
+				var verr *domain.Error
+				if !errors.As(err, &verr) {
+					t.Fatalf("want *domain.Error, got %T: %v", err, err)
+				}
+				if verr.Code != tc.wantErrCode {
+					t.Errorf("code: got %q want %q", verr.Code, tc.wantErrCode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if reg.DNSRecordStyle != tc.wantStyle {
+				t.Errorf("DNSRecordStyle: got %q want %q", reg.DNSRecordStyle, tc.wantStyle)
+			}
+		})
+	}
+}
+
+// TestApplyDNSRecordStyle_ErrorMessageListsValidValues confirms the
+// error detail enumerates the canonical valid set so SDK authors get
+// an actionable message. Sourced from domain.DNSRecordStyles().
+func TestApplyDNSRecordStyle_ErrorMessageListsValidValues(t *testing.T) {
+	reg := &domain.AgentRegistration{}
+	err := applyDNSRecordStyle(reg, RegisterRequest{
+		SchemaVersion: "V2", DNSRecordStyle: domain.DNSRecordStyle("garbage"),
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, want := range domain.DNSRecordStyles() {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error message must list %q; got %q", want, err.Error())
+		}
+	}
+}
+
+// ----- applyAgentCardContentHash -----
+
+// TestApplyAgentCardContentHash covers the empty / valid / malformed
+// branches. Empty is the spec-conformant "no Trust Card body submitted"
+// no-op; valid stamps a 64-char SHA-256 hex digest; malformed surfaces
+// INVALID_AGENT_CARD_CONTENT.
+func TestApplyAgentCardContentHash(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     []byte
+		wantHash    bool
+		wantErrCode string
+	}{
+		{name: "empty_is_noop", content: nil},
+		{name: "valid_json_sets_hash", content: []byte(`{"name":"agent","version":"1.0.0"}`), wantHash: true},
+		{name: "malformed_json_rejected", content: []byte(`{not json`), wantErrCode: "INVALID_AGENT_CARD_CONTENT"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := &domain.AgentRegistration{}
+			err := applyAgentCardContentHash(reg, tc.content)
+			if tc.wantErrCode != "" {
+				if err == nil {
+					t.Fatalf("want error code %q, got nil", tc.wantErrCode)
+				}
+				var verr *domain.Error
+				if !errors.As(err, &verr) {
+					t.Fatalf("want *domain.Error, got %T: %v", err, err)
+				}
+				if verr.Code != tc.wantErrCode {
+					t.Errorf("code: got %q want %q", verr.Code, tc.wantErrCode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.wantHash && len(reg.CapabilitiesHash) != 64 {
+				t.Errorf("expected 64-char hex digest, got len %d: %q",
+					len(reg.CapabilitiesHash), reg.CapabilitiesHash)
+			}
+			if !tc.wantHash && reg.CapabilitiesHash != "" {
+				t.Errorf("expected empty hash, got %q", reg.CapabilitiesHash)
+			}
+		})
+	}
+}
+
+// TestHashAgentCardContent_DeterministicAcrossKeyOrder pins the JCS
+// canonicalization invariant: two JSON objects with the same fields in
+// different orders produce the same digest. This is what makes the
+// cross-channel guarantee (DNS card-sha256 ↔ TL capabilities_hash ↔
+// live Trust Card body) work — the wire form can vary, the canonical
+// form cannot.
+func TestHashAgentCardContent_DeterministicAcrossKeyOrder(t *testing.T) {
+	a, errA := hashAgentCardContent([]byte(`{"a":1,"b":2}`))
+	if errA != nil {
+		t.Fatalf("hash a: %v", errA)
+	}
+	b, errB := hashAgentCardContent([]byte(`{"b":2,"a":1}`))
+	if errB != nil {
+		t.Fatalf("hash b: %v", errB)
+	}
+	if a != b {
+		t.Errorf("JCS canonicalization should produce key-order-invariant digests: %q != %q", a, b)
+	}
 }
