@@ -87,13 +87,14 @@ type RegisterRequest struct {
 	// Empty when omitted on the registration request.
 	AgentCardContent []byte
 
-	// DNSRecordStyle selects which DNS record family the RA emits
+	// DNSRecordStyles is the set of DNS record families the RA emits
 	// in dnsRecordsProvisioned and tells the operator to publish.
-	// "consolidated" (default), "legacy", or "both". Empty value is
-	// normalized to domain.DefaultDNSRecordStyle. Invalid value
-	// surfaces as INVALID_DNS_RECORD_STYLE before the aggregate is
-	// created.
-	DNSRecordStyle domain.DNSRecordStyle
+	// Each element is one of domain.ValidDNSRecordStyles(); typical
+	// values are {ANS_SVCB} (default), {ANS_TXT}, or the
+	// {ANS_SVCB, ANS_TXT} transition union. Empty/nil normalizes to
+	// domain.DefaultDNSRecordStyles(); any invalid element surfaces
+	// as INVALID_DNS_RECORD_STYLE before the aggregate is created.
+	DNSRecordStyles []domain.DNSRecordStyle
 }
 
 // RegisterResponse is returned to the HTTP handler after a successful
@@ -336,7 +337,7 @@ func (s *RegistrationService) RegisterAgent(ctx context.Context, req RegisterReq
 		return nil, err
 	}
 
-	if err := applyDNSRecordStyle(reg, req); err != nil {
+	if err := applyDNSRecordStyles(reg, req); err != nil {
 		return nil, err
 	}
 
